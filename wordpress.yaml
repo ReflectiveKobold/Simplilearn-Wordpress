@@ -1,0 +1,199 @@
+---
+- name: Wordpress Deployment Mechanism
+  hosts: all
+  remote_user: ec2-user
+  become_user: root
+  become: yes
+  
+  vars:
+    html_directory: "/var/www/html"
+    mysql_user: "wordpress"
+    wordpress_db: "wordpress"
+    wordpress_source: "https://wordpress.org/latest.tar.gz"  ## CHANGE TO LOCAL ARCHIVE AND BE KIND TO WORDPRESS.ORG
+    
+    ## Assuming that this will be a localhost install, for more robust environments
+    ## consider a centralized mysqldb with a database name containing the name of the
+    ## wordpress instance.
+
+  tasks:
+  
+  ## GENERATE RANDOM PASSWORDS FOR MYSQL FOR THE MYSQL USER AND ROOT.
+  - set_fact:
+      mysql_pass:      "{{ lookup('password', '/dev/null chars=ascii_lowercase,ascii_uppercase,digits length=12') }}"
+      mysql_root_pass: "{{ lookup('password', '/dev/null chars=ascii_lowercase,ascii_uppercase,digits length=12') }}"
+
+  - name: Ensure Yum is up to date
+    yum:
+      name: '*'
+      state: latest
+      
+  - name: Enable nginx through Amazon Linux 2
+    shell: "amazon-linux-extras enable nginx1"
+    become: yes
+
+  - name: Install Nginx
+    yum:
+      name: nginx
+      state: latest
+
+## NORMAL PHP IN EC2 IS NOT GOOD ENOUGH FOR MODERN WORDPRESS. e.g. 
+## Your server is running PHP version 5.4.16 but WordPress 6.1.1 requires at least 5.6.20.
+## The content below gets around that.
+
+  - name: Enable modern php through Amazon Linux Extras
+    shell: "amazon-linux-extras enable php7.2"
+  
+  - name: Install PHP Elements (Including PHP by inheritance)
+    yum:
+      name: ['php-cli', 'php-pdo', 'php-fpm', 'php-json', 'php-mysqlnd']
+      state: present
+      
+  - name: Ensure PHP-FPM is installed
+    yum:
+      name: php-fpm
+      state: present
+
+  - name: Place PHP-FPM configuration file
+    ansible.builtin.copy:
+       src:  files/php-fpm-www.conf
+       dest: /etc/php-fpm.d/www.conf        
+
+  - name: Start PHP-FPM as a service
+    ansible.builtin.systemd:
+        name: php-fpm
+        state: started
+        
+  - name: Ensure PHP-FPM starts on restarts
+    ansible.builtin.systemd:
+        name: php-fpm
+        enabled: yes
+
+  - name: Install MariaDB (community MySQL)
+    yum:
+      name:  mariadb-server
+      state: present
+
+  - name: Ensure Web Path Exists {{ html_directory }}
+    ansible.builtin.file:
+      path: "{{ html_directory }}"
+      state: directory
+      mode: '0755'
+      owner: nginx
+      group: nginx
+
+  - name: Download and Install Wordpress
+    unarchive:
+      src: "{{ wordpress_source }}"
+      dest: "/var/www"
+      remote_src: yes
+
+  - name: daemon restart, configuration changes
+    ansible.builtin.systemd:
+      daemon_reload: yes
+
+  - name: Copy WP files to /var/www/html
+    shell: cp /var/www/wordpress/. /var/www/html -r
+
+  - name: Create Nginx sites-available directory
+    ansible.builtin.file:
+      path: /etc/nginx/sites-available
+      state: directory
+      mode: '0755'
+      owner: nginx
+      group: nginx
+
+  - name: Create Nginx sites-enabled directory
+    ansible.builtin.file:
+      path: /etc/nginx/sites-enabled
+      state: directory
+      mode: '0755'
+      owner: nginx
+      group: nginx
+
+  - name: Nginx Template File (/etc/nginx/nginx.conf)
+    ansible.builtin.copy:
+      src: files/nginx.conf
+      dest: /etc/nginx/nginx.conf
+      owner: nginx
+      group: nginx
+      mode: '0755'
+
+  - name: Nginx Wordpress Configuration File (/etc/nginx/sites-available/wordpress.conf)
+    ansible.builtin.copy:
+      src: files/wordpress.conf
+      dest: /etc/nginx/sites-available/wordpress.conf
+      owner: nginx
+      group: nginx
+      mode: '0755'
+      
+  - name: Nginx Wordpress Configuration File Symlink into sites-enabled
+    ansible.builtin.file:
+      src: /etc/nginx/sites-available/wordpress.conf
+      dest: /etc/nginx/sites-enabled/wordpress.conf
+      state: link
+      owner: nginx
+      group: nginx
+      mode: '0755'
+      
+  - name: Wordpress Configuration File
+    ansible.builtin.template:
+      src: templates/wp-config.php.j2
+      dest: /var/www/html/wp-config.php
+      owner: nginx
+      group: nginx
+      mode: '0644'
+
+  - name: Ensure Proper Ownership of /var/www/html files (Wordpress)
+    ansible.builtin.file:
+      dest: /var/www/html
+      owner: nginx
+      group: nginx
+      mode: '0755'
+      recurse: yes
+
+  - name: Start MySQL
+    ansible.builtin.systemd:
+      name: mariadb
+      state: started
+      
+  - name: Ensure MariaDB/MySql Starts on Restarts
+    ansible.builtin.service:
+      name: mariadb
+      enabled: true
+
+  - name: Install Pymysql
+    become: true
+    yum:
+      name:
+        - python3-pip
+        - MySQL-python
+
+  - name: Create database
+    mysql_db: db={{ wordpress_db }} state=present
+
+  - name: Create Wordpress Database User
+    mysql_user:
+      name: "{{ mysql_user }}"
+      password: "{{ mysql_pass }}"
+      priv: "{{ wordpress_db }}.*:ALL"
+      state: present
+      
+  - name: Change the MySQL/MariaDB Root Password
+    mysql_user: 
+      name: "root"
+      password: "{{ mysql_root_pass }}"
+      state: present
+
+  - name: Start Nginx
+    ansible.builtin.systemd:
+      name:  nginx
+      state: started
+      
+  - name: Ensure Nginx Starts on Restarts
+    ansible.builtin.service:
+      name: nginx
+      enabled: yes
+      
+  - debug: msg='{{ mysql_pass }}'
+
+    
